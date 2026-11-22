@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 
-# Скрипт для базовой настройки безопасности Debian-сервера
+# Скрипт для базовой настройки безопасности Debian/Ubuntu сервера
 # 
 # Если скрипт был запущен в интерактивном режиме, то в подтверждение нужно явно указывать y или n, а не просто нажимать Enter
 # 
 # Что делает:
+# - Настраивает корректную UTF-8 локаль (важно для Ubuntu)
 # - Создаёт нового пользователя с правами sudo
 # - Запрещает вход root по паролю через SSH (ключи работают)
 # - Настраивает фаервол UFW - закрывает все порты, кроме указанных
@@ -35,8 +36,9 @@ CONFIGURE_FIREWALL=true        # Настраивать UFW
 CONFIGURE_FAIL2BAN=true        # Устанавливать и настраивать fail2ban
 ASSUME_YES=false               # true = не спрашивать подтверждение установки UFW
 MIN_PASSWORD_LEN=6             # Длина пароля
+SERVER_LOCALE="en_US.UTF-8"    # Основная локаль сервера (рекомендуется для избежания ошибок)
 
-SCRIPT_VERSION=1
+SCRIPT_VERSION=2
 BACKUP_DIR=""
 LOG_FILE=""
 STEP="инициализация"
@@ -56,37 +58,37 @@ die()  { err "$*"; exit 1; }
 push_rollback() { ROLLBACK_STEPS+=("$1"); }
 
 run_rollback() {
-local i
-if (( ${#ROLLBACK_STEPS[@]} == 0 )); then
-    info "Откатывать нечего."
-    return 0
-fi
-warn "Откат: ${#ROLLBACK_STEPS[@]} шаг(ов) в обратном порядке..."
-for (( i=${#ROLLBACK_STEPS[@]}-1; i>=0; i-- )); do
-    info "  <- ${ROLLBACK_STEPS[$i]}"
-    eval "${ROLLBACK_STEPS[$i]}" || warn "Шаг отката завершился с ошибкой (продолжаю)."
-done
+    local i
+    if (( ${#ROLLBACK_STEPS[@]} == 0 )); then
+        info "Откатывать нечего."
+        return 0
+    fi
+    warn "Откат: ${#ROLLBACK_STEPS[@]} шаг(ов) в обратном порядке..."
+    for (( i=${#ROLLBACK_STEPS[@]}-1; i>=0; i-- )); do
+        info "  <- ${ROLLBACK_STEPS[$i]}"
+        eval "${ROLLBACK_STEPS[$i]}" || warn "Шаг отката завершился с ошибкой (продолжаю)."
+    done
 }
 
 on_exit() {
-local code=$?
-trap - EXIT
-if [[ "$SUCCESS" == true ]]; then
-    log "Готово. Бэкапы: $BACKUP_DIR | лог: $LOG_FILE"
-    exit 0
-fi
-if (( code == 0 )); then code=1; fi
+    local code=$?
+    trap - EXIT
+    if [[ "$SUCCESS" == true ]]; then
+        log "Готово. Бэкапы: $BACKUP_DIR | лог: $LOG_FILE"
+        exit 0
+    fi
+    if (( code == 0 )); then code=1; fi
     err "Сбой на этапе <<$STEP>> (код $code). Откатываю изменения..."
-if [[ "$IN_CONTAINER" == true && "$STEP" == *фаервол* ]]; then
-    err "Подсказка: контейнеру нужны --cap-add=NET_ADMIN --cap-add=NET_RAW."
-fi
+    if [[ "$IN_CONTAINER" == true && "$STEP" == *фаервол* ]]; then
+        err "Подсказка: контейнеру нужны --cap-add=NET_ADMIN --cap-add=NET_RAW."
+    fi
     run_rollback
-if (( ${#INSTALLED_PKGS[@]} > 0 )); then
-    info "Удаляю пакеты, установленные скриптом: ${INSTALLED_PKGS[*]}"
-    apt-get purge -y "${INSTALLED_PKGS[@]}" >/dev/null 2>&1 || true
-    apt-get autoremove -y >/dev/null 2>&1 || true
-fi
-    err "Откат завершён (обновления пакетов не откатываются)."
+    if (( ${#INSTALLED_PKGS[@]} > 0 )); then
+        info "Удаляю пакеты, установленные скриптом: ${INSTALLED_PKGS[*]}"
+        apt-get purge -y "${INSTALLED_PKGS[@]}" >/dev/null 2>&1 || true
+        apt-get autoremove -y >/dev/null 2>&1 || true
+    fi
+    err "Откат завершён (обновления пакетов и локали не откатываются)."
     exit "$code"
 }
 
@@ -125,9 +127,9 @@ restart_ssh() {
         # контейнер без init-системы
         mkdir -p /run/sshd
         if [[ -r /run/sshd.pid ]] && kill -0 "$(cat /run/sshd.pid)" 2>/dev/null; then
-        kill -HUP "$(cat /run/sshd.pid)"
+            kill -HUP "$(cat /run/sshd.pid)"
         else
-        /usr/sbin/sshd
+            /usr/sbin/sshd
         fi
     fi
 }
@@ -155,14 +157,20 @@ restore_fail2ban() {
 
 # ПРОВЕРКИ ---------------------------------------------------------------------------------------------------------------
 STEP="проверки окружения"
-[[ $EUID -eq 0 ]] || die "Запустите от root: bash $0"
+[[ $EUID -eq 0 ]] || die "Запустите от root: sudo bash $0"
 command -v apt-get >/dev/null 2>&1 || die "apt-get не найден."
+
 if [[ -r /etc/os-release ]]; then
     . /etc/os-release
-    [[ "${ID:-}" == "debian" || "${ID_LIKE:-}" == *debian* ]] || die "Скрипт только для Debian."
+    if [[ "${ID:-}" != "debian" && "${ID:-}" != "ubuntu" && "${ID_LIKE:-}" != *debian* && "${ID_LIKE:-}" != *ubuntu* ]]; then
+        die "Скрипт предназначен только для Debian и Ubuntu (обнаружено: ${ID:-unknown})."
+    fi
+    info "Определена ОС: ${PRETTY_NAME:-$ID}"
+else
+    die "Не удалось определить ОС (/etc/os-release отсутствует)."
 fi
 
-LOG_FILE="/var/log/debian-hardening-$(date +%Y%m%d-%H%M%S).log"
+LOG_FILE="/var/log/server-hardening-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 info "setup.sh v$SCRIPT_VERSION | лог: $LOG_FILE"
 
@@ -185,19 +193,37 @@ fi
 
 if [[ -f /.dockerenv || -f /run/.containerenv ]] || grep -qaE 'docker|containerd|kubepods|lxc' /proc/1/cgroup 2>/dev/null; then
     IN_CONTAINER=true
-    warn "Контейнер: UFW требует --cap-add=NET_ADMIN; systemd может отсутствовать."
+    warn "Обнаружен контейнер: UFW требует --cap-add=NET_ADMIN; systemd может отсутствовать."
 fi
 
 BACKUP_DIR=$(mktemp -d /root/hardening-backup.XXXXXX)
 chmod 700 "$BACKUP_DIR"
+
+# 0) ЛОКАЛЬ (ЯЗЫК) ---------------------------------------------------------------------------------------------------------------
+STEP="настройка локали"
+ensure_pkg locales
+if ! locale -a 2>/dev/null | grep -qi "${SERVER_LOCALE//UTF-8/utf8}"; then
+    info "Генерирую локаль $SERVER_LOCALE..."
+    locale-gen "$SERVER_LOCALE"
+fi
+
+if ! grep -q "LANG=\"$SERVER_LOCALE\"" /etc/default/locale 2>/dev/null; then
+    info "Устанавливаю $SERVER_LOCALE как системную локаль по умолчанию..."
+    update-locale LANG="$SERVER_LOCALE" LC_ALL="$SERVER_LOCALE"
+    export LANG="$SERVER_LOCALE"
+    export LC_ALL="$SERVER_LOCALE"
+    log "Локаль настроена."
+else
+    info "Локаль уже настроена корректно."
+fi
 
 # 1) ОБНОВЛЕНИЕ ---------------------------------------------------------------------------------------------------------------
 STEP="обновление системы"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 if [[ "$DO_SYSTEM_UPGRADE" == true ]]; then
-apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
-log "Система обновлена (это действие не откатывается)."
+    apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
+    log "Система обновлена (это действие не откатывается)."
 fi
 
 # 2) ПОЛЬЗОВАТЕЛЬ + SUDO ---------------------------------------------------------------------------------------------------------------
@@ -212,6 +238,7 @@ else
     printf '%s:%s\n' "$NEW_USER" "$NEW_USER_PASSWORD" | chpasswd
     log "Пользователь $NEW_USER создан."
 fi
+
 if id -nG "$NEW_USER" | grep -qw sudo; then
     info "$NEW_USER уже в группе sudo."
 else
@@ -219,7 +246,8 @@ else
     push_rollback "gpasswd -d '$NEW_USER' sudo >/dev/null 2>&1 || true"
     log "$NEW_USER добавлен в группу sudo."
 fi
-# Проверяем sudo до того, как трогаем SSH чтобы не потерять доступ
+
+# Проверяем sudo до того, как трогаем SSH, чтобы не потерять доступ
 if [[ "$USER_EXISTED" == false ]]; then
     printf '%s\n' "$NEW_USER_PASSWORD" | runuser -u "$NEW_USER" -- sudo -S -k -p '' true \
         || die "sudo для $NEW_USER не работает - прерываю до изменения SSH."
@@ -233,13 +261,12 @@ mkdir -p /run/sshd /etc/ssh/sshd_config.d
 ssh-keygen -A >/dev/null 2>&1 || true
 
 SSHD_CONF=/etc/ssh/sshd_config
-# sshd берёт первое значение параметра; *.conf читаются по алфавиту.
-# 00- ставит файл в начало списка.
 DROPIN=/etc/ssh/sshd_config.d/00-hardening.conf
 DROPIN_EXISTED=false
+
 if [[ -f "$DROPIN" ]]; then
-cp -a "$DROPIN" "$BACKUP_DIR/00-hardening.conf"
-DROPIN_EXISTED=true
+    cp -a "$DROPIN" "$BACKUP_DIR/00-hardening.conf"
+    DROPIN_EXISTED=true
 fi
 
 if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$SSHD_CONF"; then
@@ -254,6 +281,7 @@ cat > "$DROPIN" <<EOF
 PermitRootLogin prohibit-password
 EOF
 chmod 644 "$DROPIN"
+
 if [[ "$DROPIN_EXISTED" == true ]]; then
     push_rollback "cp -a '$BACKUP_DIR/00-hardening.conf' '$DROPIN'; restart_ssh >/dev/null 2>&1 || true"
 else
@@ -262,14 +290,14 @@ fi
 
 /usr/sbin/sshd -t || die "sshd -t: конфигурация невалидна."
 
-# Проверка эффективного конфига до рестарта. Ошибки не прячем.
-# sshd -T печатает легаси-алиас without-password == prohibit-password.
+# Проверка эффективного конфига до рестарта.
 SSHD_T_OUT=$(/usr/sbin/sshd -T 2>"$BACKUP_DIR/sshd-T.err") || {
     cat "$BACKUP_DIR/sshd-T.err" >&2
     die "sshd -T завершился с ошибкой - причина выше."
 }
 root_login=$(printf '%s\n' "$SSHD_T_OUT" | awk '$1=="permitrootlogin"{print $2}')
 info "Эффективный PermitRootLogin: ${root_login:-не определён}"
+
 if [[ "$root_login" != "prohibit-password" && "$root_login" != "without-password" && "$root_login" != "no" ]]; then
     warn "PermitRootLogin переопределён чем-то ещё. Активные строки:"
     grep -Rni '^[[:space:]]*PermitRootLogin' "$SSHD_CONF" /etc/ssh/sshd_config.d/ >&2 || true
@@ -290,35 +318,41 @@ else
     iptables -L -n >/dev/null 2>&1 \
     || die "iptables недоступен. В контейнере: --cap-add=NET_ADMIN --cap-add=NET_RAW."
 
-cp -a /etc/ufw "$BACKUP_DIR/etc-ufw"
-ufw status | grep -q 'Status: active' && UFW_WAS_ACTIVE=true
-push_rollback "restore_ufw"
+    cp -a /etc/ufw "$BACKUP_DIR/etc-ufw"
+    ufw status | grep -q 'Status: active' && UFW_WAS_ACTIVE=true
+    push_rollback "restore_ufw"
 
-# IPv6 в контейнерах часто выключен - иначе ufw enable упадёт
-if [[ ! -e /proc/net/if_inet6 ]]; then
-    sed -i 's/^IPV6=.*/IPV6=no/' /etc/ufw/ufw.conf
-fi
-if [[ "$UFW_WAS_ACTIVE" == true ]]; then
-    warn "UFW был активен: reset на мгновение снимет фильтрацию."
-fi
+    # IPv6 в контейнерах часто выключен - иначе ufw enable упадёт
+    if [[ ! -e /proc/net/if_inet6 ]]; then
+        sed -i 's/^IPV6=.*/IPV6=no/' /etc/ufw/ufw.conf
+    fi
+    
+    if [[ "$UFW_WAS_ACTIVE" == true ]]; then
+        warn "UFW был активен: reset на мгновение снимет фильтрацию."
+    fi
 
-ufw --force reset >/dev/null
-ufw default deny incoming
-ufw default allow outgoing
+    ufw --force reset >/dev/null
+    ufw default deny incoming
+    ufw default allow outgoing
 
-# SSH открываем первым, до включения - чтобы не отрезать себя
-ufw allow "$SSH_PORT/tcp" comment 'SSH'
-# Если подключены по SSH на другой порт - тоже открываем
-if [[ -n "${SSH_CONNECTION:-}" ]]; then
-    cur_port="${SSH_CONNECTION##* }"
-if [[ "$cur_port" =~ ^[0-9]+$ && "$cur_port" != "$SSH_PORT" ]]; then
-    ufw allow "$cur_port/tcp" comment 'current SSH session'
-fi
-fi
-for p in "${TCP_PORTS[@]}"; do
-    [[ "$p" == "$SSH_PORT" ]] || ufw allow "$p/tcp"
-done
-    for p in "${UDP_PORTS[@]}"; do ufw allow "$p/udp"; done
+    # SSH открываем первым, до включения - чтобы не отрезать себя
+    ufw allow "$SSH_PORT/tcp" comment 'SSH'
+    
+    # Если подключены по SSH на другой порт - тоже открываем
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        cur_port="${SSH_CONNECTION##* }"
+        if [[ "$cur_port" =~ ^[0-9]+$ && "$cur_port" != "$SSH_PORT" ]]; then
+            ufw allow "$cur_port/tcp" comment 'current SSH session'
+        fi
+    fi
+    
+    for p in "${TCP_PORTS[@]}"; do
+        [[ "$p" == "$SSH_PORT" ]] || ufw allow "$p/tcp"
+    done
+    
+    for p in "${UDP_PORTS[@]}"; do 
+        ufw allow "$p/udp"
+    done
 
     ufw --force enable
     ufw status | grep -q 'Status: active' || die "UFW не активировался."
@@ -339,9 +373,9 @@ else
     fi
     push_rollback "restore_fail2ban"
 
-# Создаём локальную конфигурацию для SSH
-mkdir -p /etc/fail2ban/jail.d
-cat > /etc/fail2ban/jail.d/ssh.conf <<EOF
+    # Создаём локальную конфигурацию для SSH
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/ssh.conf <<EOF
 # setup.sh, $(date -Is)
 # Защита SSH от brute-force атак
 [sshd]
@@ -354,9 +388,10 @@ bantime = 3600
 findtime = 600
 backend = systemd
 EOF
-chmod 644 /etc/fail2ban/jail.d/ssh.conf
-if [[ ! -f /etc/fail2ban/jail.local ]]; then
-    cat > /etc/fail2ban/jail.local <<EOF
+    chmod 644 /etc/fail2ban/jail.d/ssh.conf
+    
+    if [[ ! -f /etc/fail2ban/jail.local ]]; then
+        cat > /etc/fail2ban/jail.local <<EOF
 # setup.sh, $(date -Is)
 # Базовые настройки fail2ban
 [DEFAULT]
@@ -366,29 +401,29 @@ findtime = 600
 maxretry = 5
 backend = systemd
 EOF
-    chmod 644 /etc/fail2ban/jail.local
-fi
+        chmod 644 /etc/fail2ban/jail.local
+    fi
 
-# Запуск и включение fail2ban
-if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
-    systemctl enable fail2ban >/dev/null 2>&1
-    systemctl restart fail2ban >/dev/null 2>&1
-    sleep 2
-    if systemctl is-active --quiet fail2ban; then
-        log "Fail2ban запущен и активен."
-        if fail2ban-client status sshd >/dev/null 2>&1; then
-            info "SSH jail активен."
-            fail2ban-client status sshd | grep -E 'Currently|Total' || true
+    # Запуск и включение fail2ban
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+        systemctl enable fail2ban >/dev/null 2>&1
+        systemctl restart fail2ban >/dev/null 2>&1
+        sleep 2
+        if systemctl is-active --quiet fail2ban; then
+            log "Fail2ban запущен и активен."
+            if fail2ban-client status sshd >/dev/null 2>&1; then
+                info "SSH jail активен."
+                fail2ban-client status sshd | grep -E 'Currently|Total' || true
+            else
+                warn "SSH jail не активен - проверьте конфигурацию."
+            fi
         else
-            warn "SSH jail не активен - проверьте конфигурацию."
+            die "Fail2ban не запустился. Проверьте логи: journalctl -u fail2ban"
         fi
     else
-        die "Fail2ban не запустился. Проверьте логи: journalctl -u fail2ban"
+        warn "systemd недоступен - fail2ban установлен, но не запущен."
+        info "Запустите вручную: fail2ban-client start"
     fi
-else
-    warn "systemd недоступен - fail2ban установлен, но не запущен."
-    info "Запустите вручную: fail2ban-client start"
-fi
 fi
 
 # ИТОГ ---------------------------------------------------------------------------------------------------------------
