@@ -243,10 +243,10 @@ DROPIN_EXISTED=true
 fi
 
 if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$SSHD_CONF"; then
-cp -a "$SSHD_CONF" "$BACKUP_DIR/sshd_config"
-sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' "$SSHD_CONF"
-push_rollback "cp -a '$BACKUP_DIR/sshd_config' '$SSHD_CONF'; restart_ssh >/dev/null 2>&1 || true"
-fienable
+    cp -a "$SSHD_CONF" "$BACKUP_DIR/sshd_config"
+    sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' "$SSHD_CONF"
+    push_rollback "cp -a '$BACKUP_DIR/sshd_config' '$SSHD_CONF'; restart_ssh >/dev/null 2>&1 || true"
+fi
 
 cat > "$DROPIN" <<EOF
 # setup.sh, $(date -Is)
