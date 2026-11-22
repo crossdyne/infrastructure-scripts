@@ -3,7 +3,8 @@
 #  1) Запрет входа root по паролю через SSH (ключи остаются)
 #  2) Создание пользователя с sudo (имя/пароль — в настройках ниже)
 #  3) UFW закрыть всё входящее, открыть порты из конфига; нет UFW — спросит
-#  4) Обновление системы + проверки + автоматический откат при ошибке
+#  4) Установка и настройка fail2ban для защиты SSH
+#  5) Обновление системы + проверки + автоматический откат при ошибке
 #
 # Запуск: bash setup.sh (от root)
 
@@ -17,6 +18,7 @@ TCP_PORTS=(22 80 443)          # Разрешённые TCP-порты
 UDP_PORTS=()                   # Разрешённые UDP-порты
 DO_SYSTEM_UPGRADE=true         # Выполнять apt-get upgrade
 CONFIGURE_FIREWALL=true        # Настраивать UFW
+CONFIGURE_FAIL2BAN=true        # Устанавливать и настраивать fail2ban
 ASSUME_YES=false               # true = не спрашивать подтверждение установки UFW
 MIN_PASSWORD_LEN=6
 # -----------------------------------------------------------------------------
@@ -124,6 +126,16 @@ restore_ufw() {
     fi
     if [[ "$UFW_WAS_ACTIVE" == true ]]; then
         ufw --force enable >/dev/null 2>&1 || warn "Не удалось вернуть UFW в активное состояние."
+    fi
+}
+
+restore_fail2ban() {
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+        systemctl stop fail2ban >/dev/null 2>&1 || true
+    fi
+    if [[ -d "$BACKUP_DIR/etc-fail2ban" ]]; then
+        rm -rf /etc/fail2ban
+        cp -a "$BACKUP_DIR/etc-fail2ban" /etc/fail2ban
     fi
 }
 
@@ -298,8 +310,74 @@ ufw status | grep -q 'Status: active' || die "UFW не активировалс�
 log "UFW активен: deny incoming; TCP: ${TCP_PORTS[*]}; UDP: ${UDP_PORTS[*]:-нет}."
 fi
 
+# 5) FAIL2BAN ---------------------------------------------------------------------------------------------------------------
+STEP="настройка fail2ban"
+if [[ "$CONFIGURE_FAIL2BAN" != true ]]; then
+    info "Fail2ban пропущен (CONFIGURE_FAIL2BAN=false)."
+elif ! command -v fail2ban-client >/dev/null 2>&1 && ! ask_yes "Fail2ban не установлен. Установить?"; then
+    warn "Установка fail2ban отклонена — пропущено."
+else
+    ensure_pkg fail2ban
+    
+    if [[ -d /etc/fail2ban ]]; then
+        cp -a /etc/fail2ban "$BACKUP_DIR/etc-fail2ban"
+    fi
+    push_rollback "restore_fail2ban"
+    
+    # Создаём локальную конфигурацию для SSH
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/ssh.conf <<EOF
+# setup.sh, $(date -Is)
+# Защита SSH от brute-force атак
+[sshd]
+enabled = true
+port = $SSH_PORT
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 3600
+findtime = 600
+backend = systemd
+EOF
+    chmod 644 /etc/fail2ban/jail.d/ssh.conf
+    if [[ ! -f /etc/fail2ban/jail.local ]]; then
+        cat > /etc/fail2ban/jail.local <<EOF
+# setup.sh, $(date -Is)
+# Базовые настройки fail2ban
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1
+bantime = 3600
+findtime = 600
+maxretry = 5
+backend = systemd
+EOF
+        chmod 644 /etc/fail2ban/jail.local
+    fi
+    
+    # Запуск и включение fail2ban
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+        systemctl enable fail2ban >/dev/null 2>&1
+        systemctl restart fail2ban >/dev/null 2>&1
+        sleep 2
+        if systemctl is-active --quiet fail2ban; then
+            log "Fail2ban запущен и активен."
+            if fail2ban-client status sshd >/dev/null 2>&1; then
+                info "SSH jail активен."
+                fail2ban-client status sshd | grep -E 'Currently|Total' || true
+            else
+                warn "SSH jail не активен — проверьте конфигурацию."
+            fi
+        else
+            die "Fail2ban не запустился. Проверьте логи: journalctl -u fail2ban"
+        fi
+    else
+        warn "systemd недоступен — fail2ban установлен, но не запущен."
+        info "Запустите вручную: fail2ban-client start"
+    fi
+fi
+
 # ИТОГ ---------------------------------------------------------------------------------------------------------------
 STEP="завершение"
 SUCCESS=true
 log "Все шаги выполнены."
-info "Юзер: $NEW_USER (sudo) | SSH-порт: $SSH_PORT | root по паролю SSH: запрещён."
+info "Юзер: $NEW_USER (sudo) | SSH-порт: $SSH_PORT | root по паролю SSH: запрещён | fail2ban: $([ "$CONFIGURE_FAIL2BAN" == true ] && echo 'настроен' || echo 'пропущен')."
